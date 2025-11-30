@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"github.com/ZenPrivacy/zen-core/internal/redacted"
+	utls "github.com/refraction-networking/utls"
+	"golang.org/x/net/http2"
 )
 
 // certGenerator is an interface capable of generating certificates for the proxy.
@@ -41,6 +43,148 @@ type Proxy struct {
 	transparentHostsMu sync.RWMutex
 }
 
+// --- UTLSTransport (per-request uTLS + H2/H1 handling) ---
+//
+// This RoundTripper performs a uTLS handshake for each request and then
+// issues the request either using an http2.ClientConn (if ALPN h2) or
+// by writing the request directly over the uTLS connection (HTTP/1.1).
+// The response body is wrapped so closing it closes the underlying connection.
+type UTLSTransport struct {
+	Fingerprint utls.ClientHelloID
+	Dialer      *net.Dialer
+	// Timeout for dial/handshake (optional)
+	DialTimeout time.Duration
+}
+
+type responseBodyCloser struct {
+	io.ReadCloser
+	conn net.Conn
+}
+
+func (r *responseBodyCloser) Close() error {
+	_ = r.ReadCloser.Close()
+	return r.conn.Close()
+}
+
+func (t *UTLSTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	// Clone the request to avoid mutating caller's object
+	ctx := req.Context()
+	req2 := req.Clone(ctx)
+	// Clear RequestURI so http.Client accepts it (it must be origin-form)
+	req2.RequestURI = ""
+
+	// Hostname for TLS/SNI
+	host := req.URL.Hostname()
+	if host == "" {
+		// fallback: use Host field if URL.Hostname empty
+		host = req.Host
+	}
+
+	// Build address for TCP dial
+	addr := net.JoinHostPort(host, "443")
+
+	// Dial TCP
+	dialer := t.Dialer
+	if dialer == nil {
+		dialer = &net.Dialer{Timeout: 15 * time.Second}
+	}
+	var rawConn net.Conn
+	var err error
+	if t.DialTimeout > 0 {
+		dctx, cancel := context.WithTimeout(ctx, t.DialTimeout)
+		defer cancel()
+		rawConn, err = dialer.DialContext(dctx, "tcp", addr)
+	} else {
+		rawConn, err = dialer.Dial("tcp", addr)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("tcp dial: %w", err)
+	}
+
+	// Prepare uTLS config
+	cfg := &utls.Config{
+		ServerName: host,
+		MinVersion: utls.VersionTLS12,
+		NextProtos: []string{"h2", "http/1.1"},
+	}
+
+	// Build uTLS client with requested fingerprint
+	uconn := utls.UClient(rawConn, cfg, t.Fingerprint)
+
+	// Ensure ALPN extension present (some fingerprints override it), then rebuild
+	if err := uconn.BuildHandshakeState(); err != nil {
+		rawConn.Close()
+		return nil, fmt.Errorf("build handshake state 1: %w", err)
+	}
+	found := false
+	for i, ext := range uconn.Extensions {
+		if _, ok := ext.(*utls.ALPNExtension); ok {
+			uconn.Extensions[i] = &utls.ALPNExtension{AlpnProtocols: []string{"h2", "http/1.1"}}
+			found = true
+			break
+		}
+	}
+	if !found {
+		uconn.Extensions = append(uconn.Extensions, &utls.ALPNExtension{AlpnProtocols: []string{"h2", "http/1.1"}})
+	}
+	if err := uconn.BuildHandshakeState(); err != nil {
+		rawConn.Close()
+		return nil, fmt.Errorf("build handshake state 2: %w", err)
+	}
+
+	// Handshake (context-aware if available)
+	if err := uconn.HandshakeContext(ctx); err != nil {
+		rawConn.Close()
+		return nil, fmt.Errorf("utls handshake: %w", err)
+	}
+
+	cs := uconn.ConnectionState()
+	log.Printf("[uTLS] %s negotiated ALPN=%q tlsver=0x%x\n", host, cs.NegotiatedProtocol, cs.Version)
+
+	// If HTTP/2 negotiated -> build http2.ClientConn over the existing uconn
+	if cs.NegotiatedProtocol == "h2" {
+		t2 := &http2.Transport{
+			// Let NewClientConn use the existing TLS connection
+			AllowHTTP: false,
+		}
+		cc, err := t2.NewClientConn(uconn)
+		if err != nil {
+			uconn.Close()
+			return nil, fmt.Errorf("http2 NewClientConn: %w", err)
+		}
+
+		// Ensure the request is origin-form: URL should already be set appropriate by caller.
+		// Use cc.RoundTrip to perform the request over this connection.
+		resp, err := cc.RoundTrip(req2)
+		if err != nil {
+			_ = cc.Close()
+			return nil, err
+		}
+
+		// Wrap body so closing it also closes underlying connection
+		resp.Body = &responseBodyCloser{ReadCloser: resp.Body, conn: uconn}
+		return resp, nil
+	}
+
+	// Otherwise: HTTP/1.1 path — write request and read response directly on uconn
+	// Ensure Host header is set
+	if req2.Host == "" {
+		req2.Host = req2.URL.Host
+	}
+	if err := req2.Write(uconn); err != nil {
+		uconn.Close()
+		return nil, fmt.Errorf("write request: %w", err)
+	}
+	br := bufio.NewReader(uconn)
+	resp, err := http.ReadResponse(br, req2)
+	if err != nil {
+		uconn.Close()
+		return nil, fmt.Errorf("read response: %w", err)
+	}
+	resp.Body = &responseBodyCloser{ReadCloser: resp.Body, conn: uconn}
+	return resp, nil
+}
+
 func NewProxy(filter filter, certGenerator certGenerator, port int) (*Proxy, error) {
 	if filter == nil {
 		return nil, errors.New("filter is nil")
@@ -60,13 +204,21 @@ func NewProxy(filter filter, certGenerator certGenerator, port int) (*Proxy, err
 		Timeout:   60 * time.Second,
 		KeepAlive: 30 * time.Second,
 	}
+
+	// Keep a default requestTransport for non-HTTPS short-circuit uses (not used for MITM).
 	p.requestTransport = &http.Transport{
 		Dial:                p.netDialer.Dial,
 		TLSHandshakeTimeout: 20 * time.Second,
 	}
+
+	// Use UTLSTransport for all client requests so uTLS fingerprint is used.
 	p.requestClient = &http.Client{
-		Timeout:   60 * time.Second,
-		Transport: p.requestTransport,
+		Timeout: 60 * time.Second,
+		Transport: &UTLSTransport{
+			Fingerprint: utls.HelloFirefox_120, // change if you want another fingerprint
+			Dialer:      p.netDialer,
+			DialTimeout: 15 * time.Second,
+		},
 		// Let the client handle any redirects.
 		CheckRedirect: func(*http.Request, []*http.Request) error {
 			return http.ErrUseLastResponse
@@ -152,6 +304,7 @@ func (p *Proxy) proxyHTTP(w http.ResponseWriter, r *http.Request) {
 		p.proxyWebsocket(w, r)
 		return
 	}
+	log.Printf("[uTLS ProxyHTTP r] %s", r)
 
 	r.RequestURI = ""
 
@@ -166,7 +319,7 @@ func (p *Proxy) proxyHTTP(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 
 	removeHopHeaders(resp.Header)
-
+	log.Printf("[uTLS ProxyHTTP] %s", resp.Header)
 	if err := p.filter.HandleResponse(r, resp); err != nil {
 		log.Printf("error handling response by filter: %v", err)
 		http.Error(w, err.Error(), http.StatusBadGateway)
@@ -292,7 +445,14 @@ func (p *Proxy) proxyConnect(w http.ResponseWriter, connReq *http.Request) {
 			continue
 		}
 
-		resp, err := p.requestTransport.RoundTrip(req)
+		// Convert request to client-style (origin-form) so http.Client.Do accepts it.
+		req.RequestURI = ""
+		//req.URL.Scheme = "https"
+		// url.Host may contain port; we want host only for URL.Host (client-friendly).
+		req.URL.Host = host
+		log.Printf("[uTLS ProxyConnect req] %s", req)
+
+		resp, err := p.requestClient.Do(req)
 		if err != nil {
 			if strings.Contains(err.Error(), "tls: ") {
 				log.Printf("adding %s to ignored hosts", redacted.Redacted(host))
@@ -305,8 +465,36 @@ func (p *Proxy) proxyConnect(w http.ResponseWriter, connReq *http.Request) {
 			tlsConn.Write([]byte(response))
 			break
 		}
+		/*
+		// ----------------------------
+		// FORCE DOWNSTREAM HTTP/1.1
+		// ----------------------------
+		resp.Proto = "HTTP/1.1"
+		resp.ProtoMajor = 1
+		resp.ProtoMinor = 1
+		resp.Status = fmt.Sprintf("%d %s", resp.StatusCode, http.StatusText(resp.StatusCode))
+
+		// Clean H2-specific headers
+		resp.Header.Del("Alt-Svc")
+		resp.Header.Del("HTTP2-Settings")
+		resp.Header.Del("Connection")
+		resp.Header.Del("Upgrade")
+		*/
+
+		//FIX A: Ensure Content-Length is set
+		if resp.Header.Get("Content-Length") == "" && resp.ContentLength >= 0 {
+		    resp.Header.Set("Content-Length", fmt.Sprintf("%d", resp.ContentLength))
+		}
+		// Ensure correct framing
+		if resp.ContentLength == -1 {
+		    resp.TransferEncoding = []string{"chunked"}
+		}
+
+
 
 		removeHopHeaders(resp.Header)
+		log.Printf("[uTLS ProxyConnect] %s", resp)
+
 
 		if err := p.filter.HandleResponse(req, resp); err != nil {
 			log.Printf("error handling response by filter for %q: %v", redacted.Redacted(req.URL), err)
@@ -325,6 +513,43 @@ func (p *Proxy) proxyConnect(w http.ResponseWriter, connReq *http.Request) {
 			}
 			break
 		}
+
+		/*
+		// STREAM RESPONSE MANUALLY to tlsConn (safe against early client disconnect)
+		// Write status line
+		_, _ = fmt.Fprintf(tlsConn, "HTTP/1.1 %d %s\r\n", resp.StatusCode, http.StatusText(resp.StatusCode))
+		// Write headers
+		for k, vv := range resp.Header {
+			for _, v := range vv {
+				_, _ = fmt.Fprintf(tlsConn, "%s: %s\r\n", k, v)
+			}
+		}
+		_, _ = fmt.Fprint(tlsConn, "\r\n")
+
+		// Stream body in chunks; on client disconnect stop and cleanup.
+		buf := make([]byte, 32*1024)
+		for {
+			n, rerr := resp.Body.Read(buf)
+			if n > 0 {
+				_, werr := tlsConn.Write(buf[:n])
+				if werr != nil {
+					if isCloseable(werr) || strings.Contains(werr.Error(), "broken pipe") {
+						log.Printf("client disconnected early while writing to %s: %v", redacted.Redacted(connReq.Host), werr)
+						break
+					}
+					log.Printf("write error while writing to %s: %v", redacted.Redacted(connReq.Host), werr)
+					break
+				}
+			}
+			if rerr != nil {
+				if rerr != io.EOF {
+					log.Printf("reading body(%s): %v", redacted.Redacted(connReq.Host), rerr)
+				}
+				break
+			}
+		}
+		*/
+
 		if err := resp.Body.Close(); err != nil {
 			log.Printf("closing body(%q): %v", redacted.Redacted(connReq.Host), err)
 		}
