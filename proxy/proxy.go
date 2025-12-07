@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -10,14 +11,320 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/ZenPrivacy/zen-core/internal/redacted"
-	utls "github.com/refraction-networking/utls"
+	//utls "github.com/refraction-networking/utls"
 	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/hpack"
+	utls "github.com/bogdanfinn/utls"
+	"github.com/bogdanfinn/utls/dicttls"
 )
+
+// H2Fingerprint defines the specific HTTP/2 parameters to mimic a browser.
+type H2Fingerprint struct {
+	Settings              []http2.Setting
+	WindowUpdateIncrement uint32
+	PseudoHeaderOrder     []string
+	HeaderPriority        []string // Order of standard headers
+	PriorityParam         http2.PriorityParam
+}
+
+var Firefox135TLSFingerprint = utls.ClientHelloSpec{
+				CipherSuites: []uint16{
+					utls.TLS_AES_128_GCM_SHA256,
+					utls.TLS_CHACHA20_POLY1305_SHA256,
+					utls.TLS_AES_256_GCM_SHA384,
+					utls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+					utls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+					utls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+					utls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+					utls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+					utls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+					utls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
+					utls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
+					utls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+					utls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
+					utls.TLS_RSA_WITH_AES_128_GCM_SHA256,
+					utls.TLS_RSA_WITH_AES_256_GCM_SHA384,
+					utls.TLS_RSA_WITH_AES_128_CBC_SHA,
+					utls.TLS_RSA_WITH_AES_256_CBC_SHA,
+				},
+				CompressionMethods: []byte{
+					utls.CompressionNone,
+				},
+				Extensions: []utls.TLSExtension{
+					&utls.SNIExtension{},
+					&utls.ExtendedMasterSecretExtension{},
+					&utls.RenegotiationInfoExtension{
+						Renegotiation: utls.RenegotiateOnceAsClient,
+					},
+					&utls.SupportedCurvesExtension{Curves: []utls.CurveID{
+						utls.X25519MLKEM768,
+						utls.X25519,
+						utls.CurveP256,
+						utls.CurveP384,
+						utls.CurveP521,
+						utls.FAKEFFDHE2048,
+						utls.FAKEFFDHE3072,
+					}},
+					&utls.SupportedPointsExtension{SupportedPoints: []byte{
+						utls.PointFormatUncompressed,
+					}},
+					&utls.ALPNExtension{AlpnProtocols: []string{
+						"h2",
+						"http/1.1",
+					}},
+					&utls.StatusRequestExtension{},
+					&utls.DelegatedCredentialsExtension{SupportedSignatureAlgorithms: []utls.SignatureScheme{
+						utls.ECDSAWithP256AndSHA256,
+						utls.ECDSAWithP384AndSHA384,
+						utls.ECDSAWithP521AndSHA512,
+						utls.ECDSAWithSHA1,
+					}},
+					&utls.SCTExtension{},
+					&utls.KeyShareExtension{KeyShares: []utls.KeyShare{
+						{Group: utls.X25519MLKEM768},
+						{Group: utls.X25519},
+						{Group: utls.CurveP256},
+					}},
+					&utls.SupportedVersionsExtension{Versions: []uint16{
+						utls.VersionTLS13,
+						utls.VersionTLS12,
+					}},
+					&utls.SignatureAlgorithmsExtension{SupportedSignatureAlgorithms: []utls.SignatureScheme{
+						utls.ECDSAWithP256AndSHA256,
+						utls.ECDSAWithP384AndSHA384,
+						utls.ECDSAWithP521AndSHA512,
+						utls.PSSWithSHA256,
+						utls.PSSWithSHA384,
+						utls.PSSWithSHA512,
+						utls.PKCS1WithSHA256,
+						utls.PKCS1WithSHA384,
+						utls.PKCS1WithSHA512,
+						utls.ECDSAWithSHA1,
+						utls.PKCS1WithSHA1,
+					}},
+					&utls.FakeRecordSizeLimitExtension{Limit: 0x4001},
+					&utls.UtlsCompressCertExtension{Algorithms: []utls.CertCompressionAlgo{
+						utls.CertCompressionZlib,
+						utls.CertCompressionBrotli,
+						utls.CertCompressionZstd,
+					}},
+					&utls.GREASEEncryptedClientHelloExtension{
+						CandidateCipherSuites: []utls.HPKESymmetricCipherSuite{
+							{
+								KdfId:  dicttls.HKDF_SHA256,
+								AeadId: dicttls.AEAD_AES_128_GCM,
+							},
+							{
+								KdfId:  dicttls.HKDF_SHA256,
+								AeadId: dicttls.AEAD_AES_256_GCM,
+							},
+							{
+								KdfId:  dicttls.HKDF_SHA256,
+								AeadId: dicttls.AEAD_CHACHA20_POLY1305,
+							},
+						},
+						CandidatePayloadLens: []uint16{128, 223}, // +16: 144, 239
+					},
+				},
+			}
+
+var Firefox120Spec = &utls.ClientHelloSpec{
+	TLSVersMin: utls.VersionTLS12,
+	TLSVersMax: utls.VersionTLS13,
+	CipherSuites: []uint16{
+		utls.TLS_AES_128_GCM_SHA256,
+		utls.TLS_CHACHA20_POLY1305_SHA256,
+		utls.TLS_AES_256_GCM_SHA384,
+		utls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+		utls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+		utls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+		utls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+		utls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+		utls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+		utls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
+		utls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
+		utls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+		utls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
+		utls.TLS_RSA_WITH_AES_128_GCM_SHA256,
+		utls.TLS_RSA_WITH_AES_256_GCM_SHA384,
+		utls.TLS_RSA_WITH_AES_128_CBC_SHA,
+		utls.TLS_RSA_WITH_AES_256_CBC_SHA,
+	},
+	CompressionMethods: []byte{
+		0x0, // utls.CompressionNone
+	},
+	Extensions: []utls.TLSExtension{
+		&utls.SNIExtension{},
+		&utls.ExtendedMasterSecretExtension{},
+		&utls.RenegotiationInfoExtension{
+			Renegotiation: utls.RenegotiateOnceAsClient,
+		},
+		&utls.SupportedCurvesExtension{
+			Curves: []utls.CurveID{
+				utls.X25519,
+				utls.CurveP256,
+				utls.CurveP384,
+				utls.CurveP521,
+				utls.CurveID(256), // FAKE_CurveID 1
+				utls.CurveID(257), // FAKE_CurveID 2
+			},
+		},
+		&utls.SupportedPointsExtension{
+			SupportedPoints: []byte{
+				0x0, // utls.PointFormatUncompressed
+			},
+		},
+		&utls.SessionTicketExtension{},
+		&utls.ALPNExtension{
+			AlpnProtocols: []string{
+				"h2",
+				"http/1.1",
+			},
+		},
+		&utls.StatusRequestExtension{},
+		// Note: Use utls.DelegatedCredentialsExtension if Fake... doesn't exist publicly
+		&utls.DelegatedCredentialsExtension{ 
+			SupportedSignatureAlgorithms: []utls.SignatureScheme{
+				utls.ECDSAWithP256AndSHA256,
+				utls.ECDSAWithP384AndSHA384,
+				utls.ECDSAWithP521AndSHA512,
+				utls.ECDSAWithSHA1,
+			},
+		},
+		&utls.KeyShareExtension{
+			KeyShares: []utls.KeyShare{
+				{
+					Group: utls.X25519,
+				},
+				{
+					Group: utls.CurveP256,
+				},
+			},
+		},
+		&utls.SupportedVersionsExtension{
+			Versions: []uint16{
+				utls.VersionTLS13,
+				utls.VersionTLS12,
+			},
+		},
+		&utls.SignatureAlgorithmsExtension{
+			SupportedSignatureAlgorithms: []utls.SignatureScheme{
+				utls.ECDSAWithP256AndSHA256,
+				utls.ECDSAWithP384AndSHA384,
+				utls.ECDSAWithP521AndSHA512,
+				utls.PSSWithSHA256,
+				utls.PSSWithSHA384,
+				utls.PSSWithSHA512,
+				utls.PKCS1WithSHA256,
+				utls.PKCS1WithSHA384,
+				utls.PKCS1WithSHA512,
+				utls.ECDSAWithSHA1,
+				utls.PKCS1WithSHA1,
+			},
+		},
+		&utls.PSKKeyExchangeModesExtension{Modes: []byte{
+			utls.PskModeDHE,
+		}},
+		&utls.FakeRecordSizeLimitExtension{
+			Limit: 0x4001,
+		},
+		&utls.GREASEEncryptedClientHelloExtension{
+			CandidateCipherSuites: []utls.HPKESymmetricCipherSuite{
+				{
+					KdfId:  dicttls.HKDF_SHA256,
+					AeadId: dicttls.AEAD_AES_128_GCM,
+				},
+				{
+					KdfId:  dicttls.HKDF_SHA256,
+					AeadId: dicttls.AEAD_CHACHA20_POLY1305,
+				},
+			},
+			CandidatePayloadLens: []uint16{223}, // +16: 239
+		},
+	},
+}
+//var Firefox135TLSFingerprintID = utls.ClientHelloID{Firefox135TLSFingerprint, "135", nil, nil}
+// Firefox135H2Fingerprint based on "Firefox_135" from contributed_browser_profiles.go
+var Firefox135H2Fingerprint = H2Fingerprint{
+	Settings: []http2.Setting{
+		{ID: http2.SettingHeaderTableSize, Val: 65536},
+		{ID: http2.SettingEnablePush, Val: 0},
+		{ID: http2.SettingInitialWindowSize, Val: 131072},
+		{ID: http2.SettingMaxFrameSize, Val: 16384},
+	},
+	WindowUpdateIncrement: 12517377, // 12.5MB
+	PseudoHeaderOrder: []string{
+		":method",
+		":path",
+		":authority",
+		":scheme",
+	},
+	HeaderPriority: []string{
+		"user-agent",
+		"accept",
+		"accept-language",
+		"accept-encoding",
+		"referer",
+		"upgrade-insecure-requests",
+		"sec-fetch-dest",
+		"sec-fetch-mode",
+		"sec-fetch-site",
+		"sec-fetch-user",
+		"te",
+	},
+	PriorityParam: http2.PriorityParam{
+		StreamDep: 0,
+		Exclusive: false,
+		Weight:    41, // Wire value for weight 42
+	},
+}
+
+// Chrome131H2Fingerprint based on "Chrome_131" from contributed_browser_profiles.go
+var Chrome131H2Fingerprint = H2Fingerprint{
+	Settings: []http2.Setting{
+		{ID: http2.SettingHeaderTableSize, Val: 65536},
+		{ID: http2.SettingEnablePush, Val: 0},
+		{ID: http2.SettingInitialWindowSize, Val: 6291456}, // 6MB
+		{ID: http2.SettingMaxHeaderListSize, Val: 262144},
+	},
+	WindowUpdateIncrement: 15663105, // ~15.6MB
+	PseudoHeaderOrder: []string{
+		":method",
+		":authority",
+		":scheme",
+		":path",
+	},
+	// Chrome Header Order (Approximated as it's not in the uploaded file)
+	HeaderPriority: []string{
+		"host",
+		"connection",
+		"content-length",
+		"sec-ch-ua",
+		"sec-ch-ua-platform",
+		"sec-ch-ua-mobile",
+		"user-agent",
+		"accept",
+		"sec-fetch-site",
+		"sec-fetch-mode",
+		"sec-fetch-user",
+		"sec-fetch-dest",
+		"referer",
+		"accept-encoding",
+		"accept-language",
+		"cookie",
+	},
+	PriorityParam: http2.PriorityParam{
+		StreamDep: 0,
+		Exclusive: false,
+		Weight:    255, // Chrome uses default weight (256 - 1)
+	},
+}
 
 // certGenerator is an interface capable of generating certificates for the proxy.
 type certGenerator interface {
@@ -44,16 +351,11 @@ type Proxy struct {
 }
 
 // --- UTLSTransport (per-request uTLS + H2/H1 handling) ---
-//
-// This RoundTripper performs a uTLS handshake for each request and then
-// issues the request either using an http2.ClientConn (if ALPN h2) or
-// by writing the request directly over the uTLS connection (HTTP/1.1).
-// The response body is wrapped so closing it closes the underlying connection.
 type UTLSTransport struct {
-	Fingerprint utls.ClientHelloID
-	Dialer      *net.Dialer
-	// Timeout for dial/handshake (optional)
-	DialTimeout time.Duration
+	Fingerprint   utls.ClientHelloID
+	H2Fingerprint H2Fingerprint // HTTP/2 specific fingerprint configuration
+	Dialer        *net.Dialer
+	DialTimeout   time.Duration
 }
 
 type responseBodyCloser struct {
@@ -66,28 +368,141 @@ func (r *responseBodyCloser) Close() error {
 	return r.conn.Close()
 }
 
+func debugExtensions(exts []utls.TLSExtension) {
+	log.Printf("[DEBUG] Current Extensions List (%d total):", len(exts))
+	for i, ext := range exts {
+		// We use fmt.Sprintf to inspect the type, as utls extension IDs aren't always public
+		log.Printf("  [%d] Type: %T", i, ext)
+	}
+}
+
+// createFirefox135Spec generates a FRESH, thread-safe copy of the spec.
+// We use this function instead of a global variable to prevent race conditions
+// on mutable fields like KeyShares.
+func createFirefox135Spec() *utls.ClientHelloSpec {
+	return &utls.ClientHelloSpec{
+		CipherSuites: []uint16{
+			utls.TLS_AES_128_GCM_SHA256,
+			utls.TLS_CHACHA20_POLY1305_SHA256,
+			utls.TLS_AES_256_GCM_SHA384,
+			utls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+			utls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+			utls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+			utls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+			utls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+			utls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+			utls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
+			utls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
+			utls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+			utls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
+			utls.TLS_RSA_WITH_AES_128_GCM_SHA256,
+			utls.TLS_RSA_WITH_AES_256_GCM_SHA384,
+			utls.TLS_RSA_WITH_AES_128_CBC_SHA,
+			utls.TLS_RSA_WITH_AES_256_CBC_SHA,
+		},
+		CompressionMethods: []byte{
+			utls.CompressionNone,
+		},
+		Extensions: []utls.TLSExtension{
+			&utls.SNIExtension{},
+			&utls.ExtendedMasterSecretExtension{},
+			&utls.RenegotiationInfoExtension{
+				Renegotiation: utls.RenegotiateOnceAsClient,
+			},
+			&utls.SupportedCurvesExtension{Curves: []utls.CurveID{
+				utls.X25519MLKEM768,
+				utls.X25519,
+				utls.CurveP256,
+				utls.CurveP384,
+				utls.CurveP521,
+				utls.FAKEFFDHE2048,
+				utls.FAKEFFDHE3072,
+			}},
+			&utls.SupportedPointsExtension{SupportedPoints: []byte{
+				utls.PointFormatUncompressed,
+			}},
+			&utls.ALPNExtension{AlpnProtocols: []string{
+				"h2",
+				"http/1.1",
+			}},
+			&utls.StatusRequestExtension{},
+			&utls.DelegatedCredentialsExtension{SupportedSignatureAlgorithms: []utls.SignatureScheme{
+				utls.ECDSAWithP256AndSHA256,
+				utls.ECDSAWithP384AndSHA384,
+				utls.ECDSAWithP521AndSHA512,
+				utls.ECDSAWithSHA1,
+			}},
+			&utls.SCTExtension{},
+			&utls.KeyShareExtension{KeyShares: []utls.KeyShare{
+				{Group: utls.X25519MLKEM768},
+				{Group: utls.X25519},
+				{Group: utls.CurveP256},
+			}},
+			&utls.SupportedVersionsExtension{Versions: []uint16{
+				utls.VersionTLS13,
+				utls.VersionTLS12,
+			}},
+			&utls.SignatureAlgorithmsExtension{SupportedSignatureAlgorithms: []utls.SignatureScheme{
+				utls.ECDSAWithP256AndSHA256,
+				utls.ECDSAWithP384AndSHA384,
+				utls.ECDSAWithP521AndSHA512,
+				utls.PSSWithSHA256,
+				utls.PSSWithSHA384,
+				utls.PSSWithSHA512,
+				utls.PKCS1WithSHA256,
+				utls.PKCS1WithSHA384,
+				utls.PKCS1WithSHA512,
+				utls.ECDSAWithSHA1,
+				utls.PKCS1WithSHA1,
+			}},
+			&utls.FakeRecordSizeLimitExtension{Limit: 0x4001},
+			&utls.UtlsCompressCertExtension{Algorithms: []utls.CertCompressionAlgo{
+				utls.CertCompressionZlib,
+				utls.CertCompressionBrotli,
+				utls.CertCompressionZstd,
+			}},
+			&utls.GREASEEncryptedClientHelloExtension{
+				CandidateCipherSuites: []utls.HPKESymmetricCipherSuite{
+					{
+						KdfId:  dicttls.HKDF_SHA256,
+						AeadId: dicttls.AEAD_AES_128_GCM,
+					},
+					{
+						KdfId:  dicttls.HKDF_SHA256,
+						AeadId: dicttls.AEAD_AES_256_GCM,
+					},
+					{
+						KdfId:  dicttls.HKDF_SHA256,
+						AeadId: dicttls.AEAD_CHACHA20_POLY1305,
+					},
+				},
+				CandidatePayloadLens: []uint16{128, 223}, // +16: 144, 239
+			},
+		},
+	}
+}
+
 func (t *UTLSTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	// Clone the request to avoid mutating caller's object
 	ctx := req.Context()
 	req2 := req.Clone(ctx)
-	// Clear RequestURI so http.Client accepts it (it must be origin-form)
 	req2.RequestURI = ""
 
-	// Hostname for TLS/SNI
 	host := req.URL.Hostname()
 	if host == "" {
-		// fallback: use Host field if URL.Hostname empty
 		host = req.Host
 	}
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
 
-	// Build address for TCP dial
 	addr := net.JoinHostPort(host, "443")
+	log.Printf("[DEBUG] Dialing %s...", addr)
 
-	// Dial TCP
 	dialer := t.Dialer
 	if dialer == nil {
 		dialer = &net.Dialer{Timeout: 15 * time.Second}
 	}
+
 	var rawConn net.Conn
 	var err error
 	if t.DialTimeout > 0 {
@@ -101,73 +516,40 @@ func (t *UTLSTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, fmt.Errorf("tcp dial: %w", err)
 	}
 
-	// Prepare uTLS config
+	// Prepare Config
 	cfg := &utls.Config{
 		ServerName: host,
 		MinVersion: utls.VersionTLS12,
 		NextProtos: []string{"h2", "http/1.1"},
 	}
+	// 1. Create UClient
+	uconn := utls.UClient(rawConn, cfg, utls.HelloCustom, false, false, false)
 
-	// Build uTLS client with requested fingerprint
-	uconn := utls.UClient(rawConn, cfg, t.Fingerprint)
+	// 2. Define the Spec INSIDE the function (Critical Fix)
+	// This ensures every connection gets its own unique pointers.
+	spec := createFirefox135Spec()
 
-	// Ensure ALPN extension present (some fingerprints override it), then rebuild
-	if err := uconn.BuildHandshakeState(); err != nil {
+	// 3. Apply the LOCAL spec
+	if err := uconn.ApplyPreset(spec); err != nil {
 		rawConn.Close()
-		return nil, fmt.Errorf("build handshake state 1: %w", err)
-	}
-	found := false
-	for i, ext := range uconn.Extensions {
-		if _, ok := ext.(*utls.ALPNExtension); ok {
-			uconn.Extensions[i] = &utls.ALPNExtension{AlpnProtocols: []string{"h2", "http/1.1"}}
-			found = true
-			break
-		}
-	}
-	if !found {
-		uconn.Extensions = append(uconn.Extensions, &utls.ALPNExtension{AlpnProtocols: []string{"h2", "http/1.1"}})
-	}
-	if err := uconn.BuildHandshakeState(); err != nil {
-		rawConn.Close()
-		return nil, fmt.Errorf("build handshake state 2: %w", err)
+		return nil, fmt.Errorf("ApplyPreset failed: %w", err)
 	}
 
-	// Handshake (context-aware if available)
+	// 4. Handshake
 	if err := uconn.HandshakeContext(ctx); err != nil {
-		rawConn.Close()
+		uconn.Close()
 		return nil, fmt.Errorf("utls handshake: %w", err)
 	}
 
+	log.Printf("[DEBUG] Handshake Success! Proto: %s", uconn.ConnectionState().NegotiatedProtocol)
+
+	// H2 Handling
 	cs := uconn.ConnectionState()
-	log.Printf("[uTLS] %s negotiated ALPN=%q tlsver=0x%x\n", host, cs.NegotiatedProtocol, cs.Version)
-
-	// If HTTP/2 negotiated -> build http2.ClientConn over the existing uconn
 	if cs.NegotiatedProtocol == "h2" {
-		t2 := &http2.Transport{
-			// Let NewClientConn use the existing TLS connection
-			AllowHTTP: false,
-		}
-		cc, err := t2.NewClientConn(uconn)
-		if err != nil {
-			uconn.Close()
-			return nil, fmt.Errorf("http2 NewClientConn: %w", err)
-		}
-
-		// Ensure the request is origin-form: URL should already be set appropriate by caller.
-		// Use cc.RoundTrip to perform the request over this connection.
-		resp, err := cc.RoundTrip(req2)
-		if err != nil {
-			_ = cc.Close()
-			return nil, err
-		}
-
-		// Wrap body so closing it also closes underlying connection
-		resp.Body = &responseBodyCloser{ReadCloser: resp.Body, conn: uconn}
-		return resp, nil
+		return roundTripHTTP2Manual(req2, uconn, t.H2Fingerprint)
 	}
 
-	// Otherwise: HTTP/1.1 path — write request and read response directly on uconn
-	// Ensure Host header is set
+	// HTTP/1.1 Fallback
 	if req2.Host == "" {
 		req2.Host = req2.URL.Host
 	}
@@ -185,6 +567,297 @@ func (t *UTLSTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	return resp, nil
 }
 
+// roundTripHTTP2Manual implements HTTP/2 with a customizable fingerprint
+func roundTripHTTP2Manual(req *http.Request, conn net.Conn, fp H2Fingerprint) (*http.Response, error) {
+	log.Printf("[H2-DEBUG] Starting manual H2 roundtrip for %s", req.URL)
+	framer := http2.NewFramer(conn, conn)
+	framer.ReadMetaHeaders = hpack.NewDecoder(4096, nil) // Decoder for incoming headers
+
+	var writeMu sync.Mutex
+
+	// 1. Send Preface
+	log.Printf("[H2-DEBUG] Sending Preface")
+	writeMu.Lock()
+	if _, err := conn.Write([]byte(http2.ClientPreface)); err != nil {
+		writeMu.Unlock()
+		conn.Close()
+		return nil, fmt.Errorf("write preface: %w", err)
+	}
+	writeMu.Unlock()
+
+	// 2. Send Settings (From Fingerprint)
+	log.Printf("[H2-DEBUG] Sending Settings: %v", fp.Settings)
+	writeMu.Lock()
+	if err := framer.WriteSettings(fp.Settings...); err != nil {
+		writeMu.Unlock()
+		conn.Close()
+		return nil, fmt.Errorf("write settings: %w", err)
+	}
+	writeMu.Unlock()
+
+	// 3. Send Window Update (From Fingerprint)
+	if fp.WindowUpdateIncrement > 0 {
+		log.Printf("[H2-DEBUG] Sending Window Update: %d", fp.WindowUpdateIncrement)
+		writeMu.Lock()
+		if err := framer.WriteWindowUpdate(0, fp.WindowUpdateIncrement); err != nil {
+			writeMu.Unlock()
+			conn.Close()
+			return nil, fmt.Errorf("write window update: %w", err)
+		}
+		writeMu.Unlock()
+	}
+
+	// Prepare to read response
+	pr, pw := io.Pipe()
+	respChan := make(chan *http.Response, 1)
+	errChan := make(chan error, 1)
+	readLoopDone := make(chan struct{})
+
+	go func() {
+		defer close(readLoopDone)
+		defer conn.Close()
+		defer pw.Close()
+
+		for {
+			frame, err := framer.ReadFrame()
+			if err != nil {
+				if err != io.EOF {
+					log.Printf("[H2-DEBUG] ReadFrame error: %v", err)
+					select {
+					case errChan <- err:
+					default:
+					}
+				} else {
+					log.Printf("[H2-DEBUG] ReadFrame EOF")
+				}
+				return
+			}
+
+			switch f := frame.(type) {
+			case *http2.SettingsFrame:
+				log.Printf("[H2-DEBUG] Received SETTINGS flags=%v", f.Flags)
+				if f.IsAck() {
+					continue
+				}
+				// Reply to server settings
+				writeMu.Lock()
+				err := framer.WriteSettingsAck()
+				writeMu.Unlock()
+				if err != nil {
+					return
+				}
+
+			case *http2.MetaHeadersFrame:
+				log.Printf("[H2-DEBUG] Received MetaHeadersFrame stream=%d endStream=%v", f.StreamID, f.StreamEnded())
+
+				decodedHeaders := f.Fields
+				res := &http.Response{
+					Proto:      "HTTP/2.0",
+					ProtoMajor: 2,
+					ProtoMinor: 0,
+					Header:     make(http.Header),
+					Body:       pr,
+					Request:    req,
+				}
+
+				for _, h := range decodedHeaders {
+					switch h.Name {
+					case ":status":
+						code, _ := strconv.Atoi(h.Value)
+						res.StatusCode = code
+						res.Status = h.Value + " " + http.StatusText(code)
+					default:
+						if !strings.HasPrefix(h.Name, ":") {
+							res.Header.Add(h.Name, h.Value)
+						}
+					}
+				}
+
+				if cl := res.Header.Get("Content-Length"); cl != "" {
+					res.ContentLength, _ = strconv.ParseInt(cl, 10, 64)
+				} else {
+					res.ContentLength = -1
+				}
+
+				respChan <- res
+
+				if f.StreamEnded() {
+					return
+				}
+
+			case *http2.DataFrame:
+				if f.StreamID != 3 {
+					continue
+				}
+				if _, err := pw.Write(f.Data()); err != nil {
+					return
+				}
+				if f.StreamEnded() {
+					return
+				}
+
+			case *http2.GoAwayFrame:
+				select {
+				case errChan <- fmt.Errorf("received GOAWAY: ErrCode=%v DebugData=%q", f.ErrCode, f.DebugData()):
+				default:
+				}
+				return
+			case *http2.RSTStreamFrame:
+				if f.StreamID == 3 {
+					select {
+					case errChan <- fmt.Errorf("stream 3 reset: ErrCode=%v", f.ErrCode):
+					default:
+					}
+					return
+				}
+			}
+		}
+	}()
+
+	// 4. Send Headers
+	streamID := uint32(3)
+	var headerBlock bytes.Buffer
+	encoder := hpack.NewEncoder(&headerBlock)
+
+	// FIX START: Use EscapedPath() or RawPath to preserve %xx encoding
+    path := req.URL.EscapedPath()
+    if path == "" {
+        // Fallback if EscapedPath is empty (rare, but good for safety)
+        path = req.URL.Path
+    }
+    if path == "" {
+        path = "/"
+    }
+    // FIX END
+	if req.URL.RawQuery != "" {
+		path += "?" + req.URL.RawQuery
+	}
+
+	authority := req.Host
+	if authority == "" {
+		authority = req.URL.Host
+	}
+
+	// Pseudo-Headers (Based on Fingerprint Order)
+	// Default fallbacks if empty to prevent breakage
+	pseudoOrder := fp.PseudoHeaderOrder
+	if len(pseudoOrder) == 0 {
+		pseudoOrder = []string{":method", ":path", ":authority", ":scheme"}
+	}
+
+	for _, k := range pseudoOrder {
+		switch k {
+		case ":method":
+			encoder.WriteField(hpack.HeaderField{Name: ":method", Value: req.Method})
+		case ":path":
+			encoder.WriteField(hpack.HeaderField{Name: ":path", Value: path})
+		case ":authority":
+			encoder.WriteField(hpack.HeaderField{Name: ":authority", Value: authority})
+		case ":scheme":
+			encoder.WriteField(hpack.HeaderField{Name: ":scheme", Value: "https"})
+		}
+	}
+
+	// Regular Headers (Based on Fingerprint Order)
+	writtenHeaders := make(map[string]bool)
+
+	for _, k := range fp.HeaderPriority {
+		if vals, ok := req.Header[http.CanonicalHeaderKey(k)]; ok {
+			for _, v := range vals {
+				encoder.WriteField(hpack.HeaderField{Name: k, Value: v})
+			}
+			writtenHeaders[k] = true
+		}
+	}
+	/*
+	// [FIX] Explicitly add Content-Length if missing from Header map
+    if req.ContentLength > 0 && req.Header.Get("Content-Length") == "" {
+        encoder.WriteField(hpack.HeaderField{
+            Name:  "content-length",
+            Value: strconv.FormatInt(req.ContentLength, 10),
+        })
+    }
+    */
+	// Write remaining headers
+	for k, vv := range req.Header {
+		lowerK := strings.ToLower(k)
+        log.Printf("[H2-FRAME] Writing Header: %s", lowerK) 
+		if writtenHeaders[lowerK] {
+			continue
+		}
+		if lowerK == "host" || lowerK == "transfer-encoding" || lowerK == "connection" || lowerK == "upgrade" || lowerK == "priority" || lowerK == "http2-settings" {
+			continue
+		}
+		for _, v := range vv {
+			encoder.WriteField(hpack.HeaderField{Name: lowerK, Value: v})
+		}
+	}
+
+	// Explicitly add Priority Header last if it's the custom H2 header
+	log.Printf("[H2-DEBUG] Adding Header: priority = u=0, i")
+	encoder.WriteField(hpack.HeaderField{Name: "priority", Value: "u=0, i"})
+	encoder.WriteField(hpack.HeaderField{Name: "te", Value: "trailers"})
+
+	log.Printf("[H2-DEBUG] Writing Headers Frame stream=%d priority=%v", streamID, fp.PriorityParam)
+	writeMu.Lock()
+	err := framer.WriteHeaders(http2.HeadersFrameParam{
+		StreamID:      streamID,
+		BlockFragment: headerBlock.Bytes(),
+		EndStream:     req.Body == nil || req.Body == http.NoBody,
+		EndHeaders:    true,
+		Priority:      fp.PriorityParam,
+	})
+	writeMu.Unlock()
+
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("write headers: %w", err)
+	}
+
+	// Handle Body upload
+	if req.Body != nil && req.Body != http.NoBody {
+		buf := make([]byte, 16384)
+		for {
+			n, err := req.Body.Read(buf)
+			if n > 0 {
+				writeMu.Lock()
+				framer.WriteData(streamID, false, buf[:n])
+				writeMu.Unlock()
+			}
+			if err != nil {
+				writeMu.Lock()
+				framer.WriteData(streamID, true, nil)
+				writeMu.Unlock()
+				break
+			}
+		}
+	}
+
+	select {
+	case res := <-respChan:
+		return res, nil
+	case err := <-errChan:
+		return nil, err
+	case <-readLoopDone:
+		return nil, errors.New("connection closed before response headers received")
+	case <-time.After(30 * time.Second):
+		conn.Close()
+		return nil, errors.New("timeout waiting for response headers")
+	}
+}
+
+// Helper to decode HPACK
+func decodeHPACK(frag []byte) ([]hpack.HeaderField, error) {
+	var headers []hpack.HeaderField
+	decoder := hpack.NewDecoder(4096, func(f hpack.HeaderField) {
+		headers = append(headers, f)
+	})
+	if _, err := decoder.Write(frag); err != nil {
+		return nil, err
+	}
+	return headers, nil
+}
+
 func NewProxy(filter filter, certGenerator certGenerator, port int) (*Proxy, error) {
 	if filter == nil {
 		return nil, errors.New("filter is nil")
@@ -200,26 +873,30 @@ func NewProxy(filter filter, certGenerator certGenerator, port int) (*Proxy, err
 	}
 
 	p.netDialer = &net.Dialer{
-		// Such high values are set to avoid timeouts on slow connections.
 		Timeout:   60 * time.Second,
 		KeepAlive: 30 * time.Second,
-	}
-
-	// Keep a default requestTransport for non-HTTPS short-circuit uses (not used for MITM).
-	p.requestTransport = &http.Transport{
-		Dial:                p.netDialer.Dial,
-		TLSHandshakeTimeout: 20 * time.Second,
-	}
-
-	// Use UTLSTransport for all client requests so uTLS fingerprint is used.
-	p.requestClient = &http.Client{
-		Timeout: 60 * time.Second,
-		Transport: &UTLSTransport{
-			Fingerprint: utls.HelloFirefox_120, // change if you want another fingerprint
-			Dialer:      p.netDialer,
-			DialTimeout: 15 * time.Second,
+		Resolver: &net.Resolver{
+			PreferGo: true,
+			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+				d := net.Dialer{
+					Timeout: 10 * time.Second,
+				}
+				return d.DialContext(ctx, "udp", "1.1.1.1:53")
+			},
 		},
-		// Let the client handle any redirects.
+	}
+
+	// Select your desired fingerprint here (Firefox or Chrome)
+	p.requestTransport = &UTLSTransport{
+		Fingerprint:   utls.HelloCustom, // Or HelloChrome_120
+		H2Fingerprint: Firefox135H2Fingerprint, // Swap with Chrome131H2Fingerprint
+		Dialer:        p.netDialer,
+		DialTimeout:   15 * time.Second,
+	}
+
+	p.requestClient = &http.Client{
+		Timeout:   60 * time.Second,
+		Transport: p.requestTransport,
 		CheckRedirect: func(*http.Request, []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
@@ -229,8 +906,6 @@ func NewProxy(filter filter, certGenerator certGenerator, port int) (*Proxy, err
 }
 
 // Start starts the proxy on the given address.
-//
-// If Proxy was configured with a port of 0, the actual port will be returned.
 func (p *Proxy) Start() (int, error) {
 	p.server = &http.Server{
 		Handler:           p,
@@ -257,7 +932,6 @@ func (p *Proxy) Stop() error {
 	if err := p.shutdownServer(); err != nil {
 		return fmt.Errorf("shut down server: %v", err)
 	}
-
 	return nil
 }
 
@@ -265,17 +939,12 @@ func (p *Proxy) shutdownServer() error {
 	if p.server == nil {
 		return nil
 	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	if err := p.server.Shutdown(ctx); err != nil {
-		// As per documentation:
-		// Shutdown does not attempt to close nor wait for hijacked connections such as WebSockets. The caller of Shutdown should separately notify such long-lived connections of shutdown and wait for them to close, if desired. See RegisterOnShutdown for a way to register shutdown notification functions.
-		// TODO: implement websocket shutdown
 		return fmt.Errorf("server shutdown: %w", err)
 	}
-
 	return nil
 }
 
@@ -300,31 +969,23 @@ func (p *Proxy) proxyHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if isWS(r) {
-		// should we remove hop-by-hop headers here?
 		p.proxyWebsocket(w, r)
 		return
 	}
-	log.Printf("[uTLS ProxyHTTP r] %s", r)
+	//log.Printf("[uTLS ProxyHTTP r] %s", r)
 
 	r.RequestURI = ""
-
-	removeHopHeaders(r.Header)
+	removeRequestHopHeaders(r.Header)
 
 	resp, err := p.requestClient.Do(r)
 	if err != nil {
-		log.Printf("error making request: %v", redacted.Redacted(err)) // The error might contain information about the hostname we are connecting to.
+		log.Printf("error making request: %v", redacted.Redacted(err))
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
 
-	removeHopHeaders(resp.Header)
-	log.Printf("[uTLS ProxyHTTP] %s", resp.Header)
-	if err := p.filter.HandleResponse(r, resp); err != nil {
-		log.Printf("error handling response by filter: %v", err)
-		http.Error(w, err.Error(), http.StatusBadGateway)
-		return
-	}
+	removeResponseHopHeaders(resp.Header)
 
 	for k, vv := range resp.Header {
 		for _, v := range vv {
@@ -336,8 +997,7 @@ func (p *Proxy) proxyHTTP(w http.ResponseWriter, r *http.Request) {
 	io.Copy(w, resp.Body)
 }
 
-// proxyConnect proxies the initial CONNECT and subsequent data between the
-// client and the remote server.
+// proxyConnect proxies the initial CONNECT and subsequent data.
 func (p *Proxy) proxyConnect(w http.ResponseWriter, connReq *http.Request) {
 	hj, ok := w.(http.Hijacker)
 	if !ok {
@@ -358,8 +1018,6 @@ func (p *Proxy) proxyConnect(w http.ResponseWriter, connReq *http.Request) {
 	}
 
 	if !p.shouldMITM(host) || net.ParseIP(host) != nil {
-		// TODO: implement upstream certificate sniffing
-		// https://docs.mitmproxy.org/stable/concepts-howmitmproxyworks/#complication-1-whats-the-remote-hostname
 		p.tunnel(clientConn, connReq)
 		return
 	}
@@ -384,23 +1042,15 @@ func (p *Proxy) proxyConnect(w http.ResponseWriter, connReq *http.Request) {
 	defer tlsConn.Close()
 	connReader := bufio.NewReader(tlsConn)
 
-	// Read requests in a loop to allow for HTTP connection reuse.
-	// https://en.wikipedia.org/wiki/HTTP_persistent_connection
 	for {
 		req, err := http.ReadRequest(connReader)
 		if err != nil {
 			if err != io.EOF {
-
 				msg := err.Error()
 				if strings.Contains(msg, "tls: ") {
 					log.Printf("adding %s to ignored hosts", redacted.Redacted(host))
 					p.addTransparentHost(host)
 				}
-
-				// The following errors occur when the underlying clientConn is closed.
-				// This usually happens during normal request/response flow when the client
-				// decides it no longer needs the connection to the host.
-				// To avoid excessive noise in the logs, we suppress these messages.
 				if !strings.HasSuffix(msg, "connection reset by peer") && !strings.HasSuffix(msg, "An existing connection was forcibly closed by the remote host.") {
 					log.Printf("reading request(%s): %v", redacted.Redacted(connReq.Host), err)
 				}
@@ -410,15 +1060,11 @@ func (p *Proxy) proxyConnect(w http.ResponseWriter, connReq *http.Request) {
 		req.URL.Host = connReq.Host
 
 		if isWS(req) {
-			// Establish transparent flow, no hop-by-hop header removal required.
 			p.proxyWebsocketTLS(req, tlsConfig, tlsConn)
 			break
 		}
 
-		// A standard CONNECT proxy establishes a TCP connection to the requested destination and relays the stream between the client and server.
-		// Here, we are MITM-ing the traffic and handling the request-response flow ourselves.
-		// Since the client and server do not share a direct TCP connection in this setup, we must strip hop-by-hop headers.
-		removeHopHeaders(req.Header)
+		removeRequestHopHeaders(req.Header)
 		req.URL.Scheme = "https"
 
 		filterResp, err := p.filter.HandleRequest(req)
@@ -426,29 +1072,16 @@ func (p *Proxy) proxyConnect(w http.ResponseWriter, connReq *http.Request) {
 			log.Printf("handling request for %q: %v", redacted.Redacted(req.URL), err)
 		}
 		if filterResp != nil {
-			if _, err := io.Copy(io.Discard, req.Body); err != nil {
-				log.Printf("discarding body for %q: %v", redacted.Redacted(req.URL), err)
-				break
-			}
-			if err := req.Body.Close(); err != nil {
-				log.Printf("closing body for %q: %v", redacted.Redacted(req.URL), err)
-				break
-			}
-			if err := filterResp.Write(tlsConn); err != nil {
-				log.Printf("writing filter response for %q: %v", redacted.Redacted(req.URL), err)
-				break
-			}
-
+			io.Copy(io.Discard, req.Body)
+			req.Body.Close()
+			filterResp.Write(tlsConn)
 			if req.Close {
 				break
 			}
 			continue
 		}
 
-		// Convert request to client-style (origin-form) so http.Client.Do accepts it.
 		req.RequestURI = ""
-		//req.URL.Scheme = "https"
-		// url.Host may contain port; we want host only for URL.Host (client-friendly).
 		req.URL.Host = host
 		log.Printf("[uTLS ProxyConnect req] %s", req)
 
@@ -458,49 +1091,25 @@ func (p *Proxy) proxyConnect(w http.ResponseWriter, connReq *http.Request) {
 				log.Printf("adding %s to ignored hosts", redacted.Redacted(host))
 				p.addTransparentHost(host)
 			}
-
 			log.Printf("roundtrip(%s): %v", redacted.Redacted(connReq.Host), err)
-			// TODO: better error presentation
 			response := fmt.Sprintf("HTTP/1.1 502 Bad Gateway\r\n\r\n%s", err.Error())
 			tlsConn.Write([]byte(response))
 			break
 		}
-		/*
-		// ----------------------------
-		// FORCE DOWNSTREAM HTTP/1.1
-		// ----------------------------
-		resp.Proto = "HTTP/1.1"
-		resp.ProtoMajor = 1
-		resp.ProtoMinor = 1
-		resp.Status = fmt.Sprintf("%d %s", resp.StatusCode, http.StatusText(resp.StatusCode))
 
-		// Clean H2-specific headers
-		resp.Header.Del("Alt-Svc")
-		resp.Header.Del("HTTP2-Settings")
-		resp.Header.Del("Connection")
-		resp.Header.Del("Upgrade")
-		*/
-
-		//FIX A: Ensure Content-Length is set
 		if resp.Header.Get("Content-Length") == "" && resp.ContentLength >= 0 {
-		    resp.Header.Set("Content-Length", fmt.Sprintf("%d", resp.ContentLength))
+			resp.Header.Set("Content-Length", fmt.Sprintf("%d", resp.ContentLength))
 		}
-		// Ensure correct framing
 		if resp.ContentLength == -1 {
-		    resp.TransferEncoding = []string{"chunked"}
+			resp.TransferEncoding = []string{"chunked"}
 		}
 
-
-
-		removeHopHeaders(resp.Header)
-		log.Printf("[uTLS ProxyConnect] %s", resp)
-
+		removeResponseHopHeaders(resp.Header)
+		//log.Printf("[uTLS ProxyConnect] %s", resp)
 
 		if err := p.filter.HandleResponse(req, resp); err != nil {
 			log.Printf("error handling response by filter for %q: %v", redacted.Redacted(req.URL), err)
-			if err := resp.Body.Close(); err != nil {
-				log.Printf("closing body for %q: %v", redacted.Redacted(req.URL), err)
-			}
+			resp.Body.Close()
 			response := fmt.Sprintf("HTTP/1.1 502 Bad Gateway\r\n\r\n%s", err.Error())
 			tlsConn.Write([]byte(response))
 			break
@@ -508,47 +1117,9 @@ func (p *Proxy) proxyConnect(w http.ResponseWriter, connReq *http.Request) {
 
 		if err := resp.Write(tlsConn); err != nil {
 			log.Printf("writing response(%q): %v", redacted.Redacted(connReq.Host), err)
-			if err := resp.Body.Close(); err != nil {
-				log.Printf("closing body(%q): %v", redacted.Redacted(connReq.Host), err)
-			}
+			resp.Body.Close()
 			break
 		}
-
-		/*
-		// STREAM RESPONSE MANUALLY to tlsConn (safe against early client disconnect)
-		// Write status line
-		_, _ = fmt.Fprintf(tlsConn, "HTTP/1.1 %d %s\r\n", resp.StatusCode, http.StatusText(resp.StatusCode))
-		// Write headers
-		for k, vv := range resp.Header {
-			for _, v := range vv {
-				_, _ = fmt.Fprintf(tlsConn, "%s: %s\r\n", k, v)
-			}
-		}
-		_, _ = fmt.Fprint(tlsConn, "\r\n")
-
-		// Stream body in chunks; on client disconnect stop and cleanup.
-		buf := make([]byte, 32*1024)
-		for {
-			n, rerr := resp.Body.Read(buf)
-			if n > 0 {
-				_, werr := tlsConn.Write(buf[:n])
-				if werr != nil {
-					if isCloseable(werr) || strings.Contains(werr.Error(), "broken pipe") {
-						log.Printf("client disconnected early while writing to %s: %v", redacted.Redacted(connReq.Host), werr)
-						break
-					}
-					log.Printf("write error while writing to %s: %v", redacted.Redacted(connReq.Host), werr)
-					break
-				}
-			}
-			if rerr != nil {
-				if rerr != io.EOF {
-					log.Printf("reading body(%s): %v", redacted.Redacted(connReq.Host), rerr)
-				}
-				break
-			}
-		}
-		*/
 
 		if err := resp.Body.Close(); err != nil {
 			log.Printf("closing body(%q): %v", redacted.Redacted(connReq.Host), err)
@@ -570,20 +1141,15 @@ func (p *Proxy) shouldMITM(host string) bool {
 			return false
 		}
 	}
-
 	return true
 }
 
-// addTransparentHost adds a host to the list of hosts that should be MITM'd.
 func (p *Proxy) addTransparentHost(host string) {
 	p.transparentHostsMu.Lock()
 	defer p.transparentHostsMu.Unlock()
-
 	p.transparentHosts = append(p.transparentHosts, host)
 }
 
-// tunnel tunnels the connection between the client and the remote server
-// without inspecting the traffic.
 func (p *Proxy) tunnel(w net.Conn, r *http.Request) {
 	remoteConn, err := net.Dial("tcp", r.Host)
 	if err != nil {
@@ -609,7 +1175,6 @@ func linkBidirectionalTunnel(src, dst io.ReadWriter) {
 	<-doneC
 }
 
-// tunnelConn tunnels the data between src and dst.
 func tunnelConn(dst io.Writer, src io.Reader, done chan<- struct{}) {
 	if _, err := io.Copy(dst, src); err != nil && !isCloseable(err) {
 		log.Printf("copying: %v", err)
@@ -617,13 +1182,10 @@ func tunnelConn(dst io.Writer, src io.Reader, done chan<- struct{}) {
 	done <- struct{}{}
 }
 
-// isCloseable returns true if the error is one that indicates the connection
-// can be closed.
 func isCloseable(err error) (ok bool) {
 	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 		return true
 	}
-
 	switch err {
 	case io.EOF, io.ErrClosedPipe, io.ErrUnexpectedEOF:
 		return true
@@ -632,23 +1194,38 @@ func isCloseable(err error) (ok bool) {
 	}
 }
 
-// Hop-by-hop headers. These are removed when sent to the backend.
-// http://www.w3.org/Protocols/rfc2616/rfc2616-sec13.html
-// Note: this may be out of date, see RFC 7230 Section 6.1.
 var hopHeaders = []string{
 	"Connection",
 	"Proxy-Connection",
 	"Keep-Alive",
 	"Proxy-Authenticate",
 	"Proxy-Authorization",
-	"Te",      // canonicalized version of "TE"
-	"Trailer", // spelling per https://www.rfc-editor.org/errata_search.php?eid=4522
+	"Te",
+	"Trailer",
 	"Transfer-Encoding",
 	"Upgrade",
 }
 
-func removeHopHeaders(header http.Header) {
+func removeResponseHopHeaders(header http.Header) {
 	for _, h := range hopHeaders {
+		header.Del(h)
+	}
+}
+
+func removeRequestHopHeaders(header http.Header) {
+	for _, h := range hopHeaders {
+		if h == "Te" {
+			// RFC 7540 Section 8.1.2.2: The TE header field MAY be present in an HTTP/2 request;
+			// when it is, it MUST NOT contain any value other than "trailers".
+			// Firefox sends "te: trailers".
+			if te := header.Get("Te"); te != "" {
+				// Canonicalize to "trailers" or remove if it contains other unsupported values for H2.
+				if strings.Contains(strings.ToLower(te), "trailers") {
+					header.Set("Te", "trailers")
+					continue // Keep it
+				}
+			}
+		}
 		header.Del(h)
 	}
 }
