@@ -38,6 +38,7 @@ import (
 	"fmt"
 	"log"
 	"math/big"
+	"os"
 	"syscall"
 	"unsafe"
 )
@@ -45,6 +46,8 @@ import (
 // caFolderName defines the name of the folder where the root CA certificate and key are stored.
 // It is capitalized to follow the general convention of using capitalized folder names on Windows.
 const caFolderName = "Certs"
+
+var firefoxProfiles = []string{os.Getenv("USERPROFILE") + "\\AppData\\Roaming\\Mozilla\\Firefox\\Profiles"}
 
 var (
 	modcrypt32                           = syscall.NewLazyDLL("crypt32.dll")
