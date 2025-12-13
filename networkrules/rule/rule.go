@@ -83,6 +83,9 @@ func (rm *Rule) ParseModifiers(modifiers []string) error {
 			modifier = &rulemodifiers.ScrambleJSModifier{}
 		case isKind("jsonprune"):
 			modifier = &rulemodifiers.JSONPruneModifier{}
+		// [NEW] Register the CSP Modifier
+		case isKind("csp"):
+			modifier = &rulemodifiers.CSPModifier{}
 		case isKind("all"):
 			// TODO: should act as "popup" modifier once it gets implemented
 			continue
