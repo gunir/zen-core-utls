@@ -4,12 +4,8 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
-
-	"github.com/ZenPrivacy/zen-core/httprewrite"
-	"golang.org/x/net/html"
 )
 
 const (
@@ -25,8 +21,8 @@ const (
 )
 
 // PatchHeaders mutates CSP headers and meta tags so an inline <script> or <style>
-// element can run. Returns the nonce to place on the inline tag. Returns "" if
-// neither headers required patching nor a CSP meta tag rewrite was scheduled.
+// element can run. Returns the nonce to place on the inline tag.
+// The nonce is safe to inject unconditionally.
 func PatchHeaders(res *http.Response, kind inlineKind) (string, error) {
 	if res == nil {
 		return "", nil
@@ -34,22 +30,18 @@ func PatchHeaders(res *http.Response, kind inlineKind) (string, error) {
 
 	nonce := newCSPNonce()
 
-	metaPatched, err := patchMetaCSPs(res, nonce, kind)
+	err := patchMetaCSPs(res, nonce, kind)
 	if err != nil {
 		return "", fmt.Errorf("patch meta CSP: %w", err)
 	}
 
-	enforcedPatched := patchOneHeader(res.Header, cspHeader, nonce, kind)
-	reportOnlyPatched := patchOneHeader(res.Header, cspReportOnly, nonce, kind)
-
-	if !metaPatched && !enforcedPatched && !reportOnlyPatched {
-		return "", nil
-	}
+	patchOneHeader(res.Header, cspHeader, nonce, kind)
+	patchOneHeader(res.Header, cspReportOnly, nonce, kind)
 
 	return nonce, nil
 }
 
-func patchOneHeader(h http.Header, key, nonce string, kind inlineKind) (patched bool) {
+func patchOneHeader(h http.Header, key, nonce string, kind inlineKind) {
 	lines := h.Values(key)
 	if len(lines) == 0 {
 		return
@@ -62,8 +54,6 @@ func patchOneHeader(h http.Header, key, nonce string, kind inlineKind) (patched 
 			h.Add(key, strings.TrimSpace(strings.Trim(v, " ;")))
 		}
 	}
-
-	return changed
 }
 
 func patchPolicies(policies []string, nonce string, kind inlineKind) ([]string, bool) {
@@ -119,96 +109,6 @@ func patchPolicies(policies []string, nonce string, kind inlineKind) ([]string, 
 	}
 
 	return policies, changed
-}
-
-func patchMetaCSPs(res *http.Response, nonce string, kind inlineKind) (bool, error) {
-	if res.Body == nil || res.Body == http.NoBody {
-		return false, nil
-	}
-
-	err := httprewrite.StreamRewrite(res, func(src io.ReadCloser, dst *io.PipeWriter) {
-		defer src.Close()
-
-		z := html.NewTokenizer(src)
-		var foundBody bool
-	loop:
-		for {
-			tt := z.Next()
-			switch tt {
-			case html.ErrorToken:
-				dst.CloseWithError(z.Err())
-				return
-			case html.StartTagToken, html.SelfClosingTagToken:
-				raw := append([]byte(nil), z.Raw()...)
-				tok := z.Token()
-
-				if strings.EqualFold(tok.Data, "meta") {
-					httpEquiv := ""
-					contentIdx := -1
-					for i, attr := range tok.Attr {
-						switch strings.ToLower(attr.Key) {
-						case "http-equiv":
-							httpEquiv = attr.Val
-						case "content":
-							contentIdx = i
-						}
-					}
-
-					if strings.EqualFold(httpEquiv, "content-security-policy") && contentIdx >= 0 {
-						patchedPolicies, changed := patchPolicies([]string{tok.Attr[contentIdx].Val}, nonce, kind)
-						if changed {
-							tok.Attr[contentIdx].Val = patchedPolicies[0]
-							if _, err := dst.Write([]byte(tok.String())); err != nil {
-								dst.CloseWithError(err)
-								return
-							}
-							continue
-						}
-					}
-				}
-
-				if _, err := dst.Write(raw); err != nil {
-					dst.CloseWithError(err)
-					return
-				}
-				if tt == html.StartTagToken && strings.EqualFold(tok.Data, "body") {
-					foundBody = true
-					break loop
-				}
-			case html.EndTagToken:
-				raw := z.Raw()
-				if _, err := dst.Write(raw); err != nil {
-					dst.CloseWithError(err)
-					return
-				}
-				tok := z.Token()
-				// The head is over, no more meta tags.
-				if strings.EqualFold(tok.Data, "head") {
-					foundBody = true
-					break loop
-				}
-			default:
-				if _, err := dst.Write(z.Raw()); err != nil {
-					dst.CloseWithError(err)
-					return
-				}
-			}
-		}
-
-		if foundBody {
-			if _, err := io.Copy(dst, src); err != nil {
-				dst.CloseWithError(err)
-				return
-			}
-		}
-
-		dst.Close()
-	})
-	if err != nil {
-		return false, err
-	}
-
-	return true, nil
 }
 
 // cutDirective splits "name [value...]" -> (lowercased name, value without leading and trailing whitespace).
