@@ -3,6 +3,8 @@ package ruletree
 import (
 	"strings"
 	"sync"
+
+	"github.com/ZenPrivacy/zen-core/internal/ruletree/byteset"
 )
 
 type Data comparable
@@ -60,11 +62,9 @@ func (t *Tree[T]) Insert(pattern string, v T) {
 	for {
 		if len(tokens) == 0 {
 			if n.isLeaf() {
-				n.leaf.val = append(n.leaf.val, v)
+				n.leaf = append(n.leaf, v)
 			} else {
-				n.leaf = &leaf[T]{
-					val: []T{v},
-				}
+				n.leaf = []T{v}
 			}
 			return
 		}
@@ -75,9 +75,7 @@ func (t *Tree[T]) Insert(pattern string, v T) {
 		if n == nil {
 			n := &node[T]{
 				prefix: tokens,
-				leaf: &leaf[T]{
-					val: []T{v},
-				},
+				leaf:   []T{v},
 			}
 			parent.addEdge(edge[T]{
 				label: tokens[0],
@@ -103,9 +101,7 @@ func (t *Tree[T]) Insert(pattern string, v T) {
 		})
 		n.prefix = n.prefix[commonPrefix:]
 
-		l := &leaf[T]{
-			val: []T{v},
-		}
+		l := []T{v}
 		if commonPrefix == len(tokens) {
 			child.leaf = l
 		} else {
@@ -140,9 +136,11 @@ func (t *Tree[T]) Get(url string) []T {
 	addUnique(t.root.traverse(url))
 
 	var (
-		inScheme     = true
-		inHost       = false
 		traverseNext = false
+
+		schemeEnd = strings.Index(url, "://")
+		hostStart = schemeEnd + 3
+		hostEnd   = strings.IndexAny(url[hostStart:], "/?")
 	)
 	for i := 1; i < len(url); i++ {
 		c := url[i]
@@ -155,18 +153,12 @@ func (t *Tree[T]) Get(url string) []T {
 			traverseNext = true
 		}
 
-		if inScheme && strings.HasSuffix(url[:i], "://") {
+		if i == hostStart {
 			addUnique(t.domainBoundaryRoot.traverse(url[i:]))
-			inScheme = false
-			inHost = true
-		} else if inHost {
-			switch c {
-			case '.':
-				if i+1 < len(url) {
-					addUnique(t.domainBoundaryRoot.traverse(url[i+1:]))
-				}
-			case '/', '?':
-				inHost = false
+		}
+		if i > hostStart && (hostEnd == -1 || i < hostStart+hostEnd) {
+			if c == '.' {
+				addUnique(t.domainBoundaryRoot.traverse(url[i+1:]))
 			}
 		}
 	}
@@ -195,14 +187,16 @@ func longestPrefix(a, b []token) int {
 }
 
 // traversalMarkers indicate traversal starting points in a URL.
-var traversalMarkers [256]bool
+var traversalMarkers byteset.Set
 
 func init() {
-	for _, ch := range "-._~:/?#[]@!$&'()*+,;%=" {
-		traversalMarkers[ch] = true
+	const markerChars = "-._~:/?#[]@!$&'()*+,;%="
+	for i := range markerChars {
+		ch := markerChars[i]
+		traversalMarkers.Add(ch)
 	}
 }
 
 func isTraversalMarker(char byte) bool {
-	return traversalMarkers[char]
+	return traversalMarkers.Has(char)
 }
