@@ -76,20 +76,29 @@ func BufferRewrite(res *http.Response, processor func(src []byte) []byte) error 
 
 // getRawBodyReader extracts an uncompressed, UTF-8 decoded body from a potentially compressed and non-UTF-8 encoded HTTP response.
 func getRawBodyReader(res *http.Response) (body io.ReadCloser, mimeType string, err error) {
-	encoding := res.Header.Get("Content-Encoding")
-	contentType := res.Header.Get("Content-Type")
+	encoding := header.Get("Content-Encoding")
+	contentType := header.Get("Content-Type")
 	mimeType, params, err := mime.ParseMediaType(contentType)
 	if err != nil {
-		return nil, "", fmt.Errorf("parse content type %q: %v", contentType, err)
-	}
-	if encoding == "" && strings.ToLower(params["charset"]) == "utf-8" {
-		// The body is already UTF-8 encoded and not compressed.
-		return res.Body, mimeType, nil
+		mimeType = "text/plain" // Fallback
 	}
 
-	decompressedReader, err := decompressReader(res.Body, encoding)
+	// [FIX 1] Treat missing charset as UTF-8 (Modern Web Default)
+	// If encoding is empty and no charset is specified, pass the body through raw.
+	charsetParam := strings.ToLower(params["charset"])
+	if encoding == "" && (charsetParam == "utf-8" || charsetParam == "") {
+		return body, mimeType, nil
+	}
+
+	decompressedReader, err := decompressReader(body, encoding)
 	if err != nil {
 		return nil, "", fmt.Errorf("create decompressed reader for encoding %q: %v", encoding, err)
+	}
+
+	// [FIX 2] If we reach here (because of compression), ensure we don't 
+	// let charset.NewReader default to Windows-1252 if charset is missing.
+	if charsetParam == "" {
+		contentType = mimeType + "; charset=utf-8"
 	}
 
 	decodedReader, err := charset.NewReader(decompressedReader, contentType)
@@ -103,7 +112,7 @@ func getRawBodyReader(res *http.Response) (body io.ReadCloser, mimeType string, 
 		io.Closer
 	}{
 		decodedReader,
-		&multiCloser{[]io.Closer{decompressedReader, res.Body}},
+		&multiCloser{[]io.Closer{decompressedReader, body}},
 	}, mimeType, nil
 }
 
