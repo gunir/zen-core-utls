@@ -76,8 +76,8 @@ func BufferRewrite(res *http.Response, processor func(src []byte) []byte) error 
 
 // getRawBodyReader extracts an uncompressed, UTF-8 decoded body from a potentially compressed and non-UTF-8 encoded HTTP response.
 func getRawBodyReader(res *http.Response) (body io.ReadCloser, mimeType string, err error) {
-	encoding := header.Get("Content-Encoding")
-	contentType := header.Get("Content-Type")
+	encoding := res.Header.Get("Content-Encoding")
+	contentType := res.Header.Get("Content-Type")
 	mimeType, params, err := mime.ParseMediaType(contentType)
 	if err != nil {
 		mimeType = "text/plain" // Fallback
@@ -87,10 +87,10 @@ func getRawBodyReader(res *http.Response) (body io.ReadCloser, mimeType string, 
 	// If encoding is empty and no charset is specified, pass the body through raw.
 	charsetParam := strings.ToLower(params["charset"])
 	if encoding == "" && (charsetParam == "utf-8" || charsetParam == "") {
-		return body, mimeType, nil
+		return res.Body, mimeType, nil
 	}
 
-	decompressedReader, err := decompressReader(body, encoding)
+	decompressedReader, err := decompressReader(res.Body, encoding)
 	if err != nil {
 		return nil, "", fmt.Errorf("create decompressed reader for encoding %q: %v", encoding, err)
 	}
@@ -112,7 +112,7 @@ func getRawBodyReader(res *http.Response) (body io.ReadCloser, mimeType string, 
 		io.Closer
 	}{
 		decodedReader,
-		&multiCloser{[]io.Closer{decompressedReader, body}},
+		&multiCloser{[]io.Closer{decompressedReader, res.Body}},
 	}, mimeType, nil
 }
 
